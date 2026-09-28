@@ -3,6 +3,11 @@ FL AceStep Training Nodes
 """
 
 from .llm_loader import FL_AceStep_LLMLoader
+from .gguf_label_corrector import (
+    FL_AceStep_GGUFLoader,
+    FL_AceStep_GGUFModelSelector,
+    FL_AceStep_GGUFLabelCorrector,
+)
 from .dataset_scan import FL_AceStep_ScanDirectory
 from .dataset_label import FL_AceStep_LabelSamples
 from .dataset_preprocess import FL_AceStep_PreprocessDataset
@@ -11,6 +16,9 @@ from .training_ui import FL_AceStep_Train
 
 __all__ = [
     "FL_AceStep_LLMLoader",
+    "FL_AceStep_GGUFLoader",
+    "FL_AceStep_GGUFModelSelector",
+    "FL_AceStep_GGUFLabelCorrector",
     "FL_AceStep_ScanDirectory",
     "FL_AceStep_LabelSamples",
     "FL_AceStep_PreprocessDataset",

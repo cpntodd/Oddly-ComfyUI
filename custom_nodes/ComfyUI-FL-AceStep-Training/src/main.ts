@@ -81,9 +81,7 @@ app.registerExtension({
   },
 });
 
-// Listen for custom training updates from Python
-api.addEventListener('acestep.training.progress', ((event: CustomEvent<TrainingProgressData>) => {
-  const detail = event.detail;
+function applyTrainingUpdate(detail: TrainingProgressData): void {
   if (!detail?.node) return;
 
   const nodeId = parseInt(detail.node, 10);
@@ -118,6 +116,29 @@ api.addEventListener('acestep.training.progress', ((event: CustomEvent<TrainingP
         widget.onTrainingComplete(detail.final_path);
       }
       break;
+  }
+}
+
+// Explicit custom-event registration is required by newer ComfyUI API builds.
+const addCustomEventListener = (api as typeof api & {
+  addCustomEventListener?: (name: string, listener: EventListener) => void;
+}).addCustomEventListener;
+
+if (addCustomEventListener) {
+  addCustomEventListener.call(api, 'acestep.training.progress', ((event: CustomEvent<TrainingProgressData>) => {
+    applyTrainingUpdate(event.detail);
+  }) as EventListener);
+} else {
+  api.addEventListener('acestep.training.progress', ((event: CustomEvent<TrainingProgressData>) => {
+    applyTrainingUpdate(event.detail);
+  }) as EventListener);
+}
+
+// Fall back to ComfyUI's native progress channel. The Python side marks its
+// payload with ace_training so ordinary sampler progress is ignored.
+api.addEventListener('progress', ((event: CustomEvent<{ ace_training?: TrainingProgressData }>) => {
+  if (event.detail?.ace_training) {
+    applyTrainingUpdate(event.detail.ace_training);
   }
 }) as EventListener);
 

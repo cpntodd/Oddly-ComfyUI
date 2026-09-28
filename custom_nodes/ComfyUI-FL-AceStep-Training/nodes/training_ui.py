@@ -45,10 +45,23 @@ TURBO_SHIFT3_TIMESTEPS = [1.0, 0.9545, 0.9, 0.8333, 0.75, 0.6429, 0.5, 0.3]
 def send_training_update(node_id, data):
     """Send real-time update to frontend via WebSocket."""
     if WEBSOCKET_AVAILABLE and PromptServer.instance is not None:
+        payload = {"node": str(node_id), **data}
         PromptServer.instance.send_sync(
             "acestep.training.progress",
-            {"node": str(node_id), **data}
+            payload,
         )
+        # Some ComfyUI frontend builds do not forward unknown event names
+        # reliably to extensions, so mirror progress on the native channel.
+        if data.get("type") == "progress":
+            PromptServer.instance.send_sync(
+                "progress",
+                {
+                    "value": data.get("epoch", 0),
+                    "max": data.get("total_epochs", 0),
+                    "node": str(node_id),
+                    "ace_training": payload,
+                },
+            )
 
 
 class PreprocessedTensorDataset(Dataset):

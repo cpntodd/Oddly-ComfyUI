@@ -549,13 +549,11 @@ app.registerExtension({
   // Called when any node is created
   nodeCreated(node) {
     var _a;
-    var comfyClass = ((_a = node.constructor) == null ? void 0 : _a.comfyClass) || "";
-    // Apply FL_ theming to all FL_AceStep nodes
+    const comfyClass = ((_a = node.constructor) == null ? void 0 : _a.comfyClass) || "";
     if (comfyClass.startsWith("FL_")) {
       node.color = "#16727c";
       node.bgcolor = "#4F0074";
     }
-    // Attach training widget only to the Train node
     if (comfyClass !== "FL_AceStep_Train") {
       return;
     }
@@ -564,8 +562,7 @@ app.registerExtension({
     createTrainingWidget(node);
   }
 });
-api.addEventListener("acestep.training.progress", ((event) => {
-  const detail = event.detail;
+function applyTrainingUpdate(detail) {
   if (!(detail == null ? void 0 : detail.node)) return;
   const nodeId = parseInt(detail.node, 10);
   const widget = widgetInstances.get(nodeId);
@@ -595,6 +592,22 @@ api.addEventListener("acestep.training.progress", ((event) => {
         widget.onTrainingComplete(detail.final_path);
       }
       break;
+  }
+}
+const addCustomEventListener = api.addCustomEventListener;
+if (addCustomEventListener) {
+  addCustomEventListener.call(api, "acestep.training.progress", ((event) => {
+    applyTrainingUpdate(event.detail);
+  }));
+} else {
+  api.addEventListener("acestep.training.progress", ((event) => {
+    applyTrainingUpdate(event.detail);
+  }));
+}
+api.addEventListener("progress", ((event) => {
+  var _a;
+  if ((_a = event.detail) == null ? void 0 : _a.ace_training) {
+    applyTrainingUpdate(event.detail.ace_training);
   }
 }));
 api.addEventListener("executed", ((event) => {

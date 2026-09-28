@@ -16,6 +16,7 @@ import json
 import logging
 import math
 import random
+import re
 from pathlib import Path
 
 import torch
@@ -54,6 +55,9 @@ DEFAULT_DIT_INSTRUCTION = "Fill the audio semantic mask based on the given condi
 
 # Cache for refer_audio placeholder tensors (avoid GPU alloc per sample)
 _REFER_AUDIO_CACHE: dict = {}
+_LYRIC_TIMESTAMP = re.compile(
+    r"^\s*\[?(\d{1,2}):(\d{2})(?:[.:](\d{1,3}))?\]?\s*(.*)$"
+)
 
 
 def _get_refer_audio_tensors(device, dtype):
@@ -105,6 +109,107 @@ def encode_text_and_lyrics(clip, text: str, lyrics: str, device, dtype):
     return text_hidden_states, text_attention_mask, lyric_hidden_states, lyric_attention_mask
 
 
+def _lyrics_for_chunk(lyrics: str, chunk_start: float, chunk_duration: float) -> str:
+    """Return timestamped lyric lines belonging to one audio chunk.
+
+    Untimestamped lyrics are returned unchanged because there is no safe way
+    to infer their alignment from plain Markdown text.
+    """
+    if not lyrics or lyrics == "[Instrumental]":
+        return lyrics
+
+    blocks = []
+    current = None
+    for line in lyrics.splitlines():
+        match = _LYRIC_TIMESTAMP.match(line)
+        if match:
+            minutes, seconds, fraction, text = match.groups()
+            offset = int(minutes) * 60 + int(seconds)
+            if fraction:
+                offset += int(fraction) / (10 ** len(fraction))
+            current = [offset, text.strip()]
+            blocks.append(current)
+        elif current is not None:
+            current[1] = f"{current[1]}\n{line}" if current[1] else line
+
+    if not blocks:
+        return lyrics
+
+    chunk_end = chunk_start + chunk_duration
+    selected = []
+    for index, (offset, text) in enumerate(blocks):
+        next_offset = blocks[index + 1][0] if index + 1 < len(blocks) else float("inf")
+        if offset < chunk_end and next_offset > chunk_start:
+            selected.append(text.strip())
+
+    return "\n".join(text for text in selected if text) or "[Instrumental]"
+
+
+def _apply_approved_labels(dataset, review_path):
+    review_file = Path(review_path)
+    if not review_file.exists():
+        raise ValueError(f"Label review file not found: {review_file}")
+
+    entries = json.loads(review_file.read_text(encoding="utf-8"))
+    approved = {entry.get("id"): entry for entry in entries if entry.get("approved") is True}
+    missing = [sample.id for sample in dataset.samples if sample.labeled and sample.id not in approved]
+    if missing:
+        raise ValueError(
+            f"{len(missing)} labeled samples are not approved in {review_file}"
+        )
+
+    for sample in dataset.samples:
+        entry = approved.get(sample.id)
+        if entry is None:
+            continue
+        for field in ("caption", "genre", "language", "lyrics"):
+            if field in entry:
+                setattr(sample, field, entry[field])
+
+    return len(approved)
+
+
+def _write_review_snapshot(path, samples):
+    """Create an editable review file before preprocessing begins."""
+    review = []
+    for sample in samples:
+        review.append({
+            "id": sample.id,
+            "audio_path": sample.audio_path,
+            "filename": sample.filename,
+            "approved": False,
+            "caption": sample.caption,
+            "genre": sample.genre,
+            "language": sample.language,
+            "lyrics": sample.lyrics,
+        })
+    review_file = Path(path)
+    review_file.parent.mkdir(parents=True, exist_ok=True)
+    review_file.write_text(
+        json.dumps(review, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    return str(review_file)
+
+
+def _is_xpu_device_lost(error):
+    message = str(error).upper()
+    return "UR_RESULT_ERROR_DEVICE_LOST" in message or "DEVICE_LOST" in message
+
+
+def _safe_empty_cache(device):
+    """Best-effort cache cleanup; a lost accelerator cannot be repaired here."""
+    try:
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        elif device.type == "xpu":
+            torch.xpu.empty_cache()
+    except Exception as error:
+        logger.warning("Skipping %s cache cleanup: %s", device, error)
+        return _is_xpu_device_lost(error)
+    return False
+
+
 class FL_AceStep_PreprocessDataset:
     """
     Preprocess Dataset
@@ -145,6 +250,15 @@ class FL_AceStep_PreprocessDataset:
                     "max": 100,
                     "step": 5,
                 }),
+                "require_label_approval": ("BOOLEAN", {
+                    "default": False,
+                    "label": "Require approved labels",
+                }),
+                "review_path": ("STRING", {
+                    "default": "./output/acestep/label_review.json",
+                    "multiline": False,
+                    "label": "Label review file",
+                }),
             }
         }
 
@@ -164,6 +278,8 @@ class FL_AceStep_PreprocessDataset:
         max_duration=240.0,
         vae_chunk_seconds=30.0,
         genre_ratio=0,
+        require_label_approval=False,
+        review_path="./output/acestep/label_review.json",
     ):
         """Preprocess the dataset to tensor files."""
         samples = dataset.samples
@@ -176,6 +292,25 @@ class FL_AceStep_PreprocessDataset:
         labeled_samples = [s for s in samples if s.labeled or s.caption]
         if not labeled_samples:
             return (output_dir, 0, "No labeled samples to preprocess")
+
+        if require_label_approval:
+            review_file = Path(review_path)
+            if not review_file.exists():
+                try:
+                    created_review = _write_review_snapshot(review_path, labeled_samples)
+                except Exception as e:
+                    return (output_dir, 0, f"Could not create label review file: {e}")
+                return (
+                    output_dir,
+                    0,
+                    f"Manual label review required. Edit {created_review} and set "
+                    "approved=true for each sample, then run preprocessing again",
+                )
+            try:
+                approved_count = _apply_approved_labels(dataset, review_path)
+                logger.info("Applied %d approved labels from %s", approved_count, review_path)
+            except Exception as e:
+                return (output_dir, 0, f"Manual label review required: {e}")
 
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
@@ -210,26 +345,30 @@ class FL_AceStep_PreprocessDataset:
             f"{total_chunks} {chunk_seconds:.0f}s chunks to {output_dir}"
         )
 
+        device_lost = False
+
         # --- Main loop: inference_mode for entire batch ---
         with torch.inference_mode():
             for i, sample in enumerate(labeled_samples):
                 source_duration = min(float(sample.duration), max_duration)
                 chunk_count = max(1, math.ceil(source_duration / chunk_seconds))
-                source_had_error = False
+                encoded_chunks = []
                 try:
+                    # Keep the VAE resident while encoding all chunks from this
+                    # source. Repeated VAE/LLM swaps were destabilising XPU.
+                    if model_management:
+                        model_management.load_models_gpu(
+                            [vae.patcher],
+                            force_full_load=getattr(vae, 'disable_offload', False),
+                        )
+                    else:
+                        vae_model.to(device)
+
                     for chunk_index in range(chunk_count):
                         chunk_start = chunk_index * chunk_seconds
                         chunk_duration = min(chunk_seconds, source_duration - chunk_start)
                         if chunk_duration < 1.0:
                             continue
-
-                        if model_management:
-                            model_management.load_models_gpu(
-                                [vae.patcher],
-                                force_full_load=getattr(vae, 'disable_offload', False),
-                            )
-                        else:
-                            vae_model.to(device)
 
                         audio = load_audio(
                             sample.audio_path,
@@ -243,14 +382,23 @@ class FL_AceStep_PreprocessDataset:
                             dtype=vae_dtype,
                         )
                         del audio
+                        encoded_chunks.append((chunk_index, chunk_start, chunk_duration, target_latents))
 
-                        if model_management:
-                            model_management.load_models_gpu([clip.patcher])
-                            model_management.load_models_gpu([model])
-                        else:
-                            clip.cond_stage_model.to(device)
-                            condition_encoder.to(device)
+                    # Keep CLIP and the ACE-Step condition encoder resident while
+                    # all encoded chunks from this source are being conditioned.
+                    if model_management:
+                        model_management.load_models_gpu([clip.patcher])
+                        model_management.load_models_gpu([model])
+                    else:
+                        clip.cond_stage_model.to(device)
+                        condition_encoder.to(device)
 
+                    for chunk_index, chunk_start, chunk_duration, target_latents in encoded_chunks:
+                        chunk_lyrics = _lyrics_for_chunk(
+                            sample.lyrics,
+                            chunk_start,
+                            chunk_duration,
+                        )
                         tensor_data = self._preprocess_sample(
                             sample=sample,
                             target_latents=target_latents,
@@ -265,6 +413,7 @@ class FL_AceStep_PreprocessDataset:
                             vae_dtype=vae_dtype,
                             enc_dtype=enc_dtype,
                             chunk_duration=chunk_duration,
+                            chunk_lyrics=chunk_lyrics,
                         )
 
                         if tensor_data is None:
@@ -300,20 +449,29 @@ class FL_AceStep_PreprocessDataset:
                     error_msg = f"Error processing sample {sample.id}: {str(e)}"
                     logger.warning(error_msg)
                     errors.append(error_msg)
-                    source_had_error = True
+                    if _is_xpu_device_lost(e):
+                        device_lost = True
+                        logger.error(
+                            "XPU device lost; stopping preprocessing. Restart "
+                            "ComfyUI before retrying."
+                        )
 
                 if pbar:
                     pbar.update(1)
 
-                if not source_had_error and model_management:
-                    model_management.load_models_gpu([model])
+                del encoded_chunks
+                if device_lost:
+                    break
 
                 # Periodic device cache clearing (every 8 samples)
                 if (i + 1) % 8 == 0:
-                    if device.type == "cuda":
-                        torch.cuda.empty_cache()
-                    elif device.type == "xpu":
-                        torch.xpu.empty_cache()
+                    if _safe_empty_cache(device):
+                        device_lost = True
+                        logger.error(
+                            "XPU device lost during cleanup; stopping preprocessing. "
+                            "Restart ComfyUI before retrying."
+                        )
+                        break
 
         # Save manifest
         manifest_path = output_path / "manifest.json"
@@ -332,6 +490,10 @@ class FL_AceStep_PreprocessDataset:
         status = f"Preprocessed {processed_count} chunks from {len(labeled_samples)} samples"
         if errors:
             status += f" ({len(errors)} errors)"
+        if device_lost:
+            status += (
+                "; stopped after XPU device loss - restart ComfyUI before retrying"
+            )
 
         logger.info(status)
         return (str(output_path), processed_count, status)
@@ -351,6 +513,7 @@ class FL_AceStep_PreprocessDataset:
         vae_dtype,
         enc_dtype,
         chunk_duration=None,
+        chunk_lyrics=None,
     ):
         """Preprocess a single sample to tensor data."""
         # The audio has already been encoded before loading the text encoder.
@@ -386,7 +549,9 @@ class FL_AceStep_PreprocessDataset:
         )
 
         # Step 4: Encode text and lyrics via ComfyUI CLIP
-        lyrics = sample.lyrics if sample.lyrics else "[Instrumental]"
+        lyrics = chunk_lyrics if chunk_lyrics is not None else (
+            sample.lyrics if sample.lyrics else "[Instrumental]"
+        )
         text_hidden_states, text_attention_mask, lyric_hidden_states, lyric_attention_mask = \
             encode_text_and_lyrics(clip, text_prompt, lyrics, device, enc_dtype)
 

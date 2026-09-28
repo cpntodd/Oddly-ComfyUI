@@ -73,6 +73,11 @@ except ImportError:
 try:
     # Loaders
     from .nodes.llm_loader import FL_AceStep_LLMLoader
+    from .nodes.gguf_label_corrector import (
+        FL_AceStep_GGUFLoader,
+        FL_AceStep_GGUFModelSelector,
+        FL_AceStep_GGUFLabelCorrector,
+    )
 
     # Dataset nodes
     from .nodes.dataset_scan import FL_AceStep_ScanDirectory
@@ -86,11 +91,14 @@ try:
     NODE_CLASS_MAPPINGS = {
         # Loaders
         "FL_AceStep_LLMLoader": FL_AceStep_LLMLoader,
+        "FL_AceStep_GGUFLoader": FL_AceStep_GGUFLoader,
+        "FL_AceStep_GGUFModelSelector": FL_AceStep_GGUFModelSelector,
 
         # Dataset
         "FL_AceStep_ScanDirectory": FL_AceStep_ScanDirectory,
         "FL_AceStep_LabelSamples": FL_AceStep_LabelSamples,
         "FL_AceStep_PreprocessDataset": FL_AceStep_PreprocessDataset,
+        "FL_AceStep_GGUFLabelCorrector": FL_AceStep_GGUFLabelCorrector,
 
         # Training
         "FL_AceStep_TrainingConfig": FL_AceStep_TrainingConfig,
@@ -100,11 +108,14 @@ try:
     NODE_DISPLAY_NAME_MAPPINGS = {
         # Loaders
         "FL_AceStep_LLMLoader": "FL AceStep LLM Loader",
+        "FL_AceStep_GGUFLoader": "FL AceStep GGUF Text Loader",
+        "FL_AceStep_GGUFModelSelector": "FL AceStep GGUF Model Selector",
 
         # Dataset
         "FL_AceStep_ScanDirectory": "FL AceStep Scan Audio Directory",
         "FL_AceStep_LabelSamples": "FL AceStep Auto-Label Samples",
         "FL_AceStep_PreprocessDataset": "FL AceStep Preprocess Dataset",
+        "FL_AceStep_GGUFLabelCorrector": "FL AceStep GGUF Label Corrector",
 
         # Training
         "FL_AceStep_TrainingConfig": "FL AceStep Training Configuration",

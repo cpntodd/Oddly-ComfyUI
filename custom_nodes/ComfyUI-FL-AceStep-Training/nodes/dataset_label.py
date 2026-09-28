@@ -5,8 +5,11 @@ Auto-labels audio samples using the LLM for metadata generation.
 Uses native ComfyUI MODEL type for the ACE-Step model.
 """
 
+import json
 import logging
 from contextlib import contextmanager
+from pathlib import Path
+import re
 
 try:
     from comfy.utils import ProgressBar
@@ -134,6 +137,59 @@ def _build_lyrics_context(sample, language_hint="Auto", label_guidance="") -> st
     return "\n\n".join(sections)
 
 
+def _enforce_language_metadata(metadata, language_hint):
+    """Apply deterministic language constraints after LLM generation."""
+    if language_hint == "Auto":
+        return metadata
+
+    language_code, language_name = language_hint.split(" — ", 1)
+    metadata["language"] = language_name
+
+    # These are common 0.6B failure modes for Macedonian/Balkan audio. Replace
+    # only explicit regional claims; preserve useful neutral audio descriptions.
+    if language_code == "MK":
+        replacements = (
+            (r"\btraditional\s+middle\s+eastern\s+music\b", "traditional folk music"),
+            (r"\bmiddle\s+eastern\b", "folk"),
+            (r"\barabic\b", "folk"),
+            (r"\bpersian\b", "folk"),
+            (r"\bduduk\b", "woodwind"),
+            (r"\boud\b", "lute-like string instrument"),
+            (r"\bdarbuka\b", "hand percussion"),
+        )
+        caption = metadata.get("caption", "")
+        genre = metadata.get("genre", "")
+        for pattern, replacement in replacements:
+            caption = re.sub(pattern, replacement, caption, flags=re.IGNORECASE)
+            genre = re.sub(pattern, replacement, genre, flags=re.IGNORECASE)
+        metadata["caption"] = caption
+        metadata["genre"] = genre
+
+    return metadata
+
+
+def _write_label_review(path, samples):
+    review = []
+    for sample in samples:
+        review.append({
+            "id": sample.id,
+            "audio_path": sample.audio_path,
+            "filename": sample.filename,
+            "approved": False,
+            "caption": sample.caption,
+            "genre": sample.genre,
+            "language": sample.language,
+            "lyrics": sample.lyrics,
+        })
+    review_path = Path(path)
+    review_path.parent.mkdir(parents=True, exist_ok=True)
+    review_path.write_text(
+        json.dumps(review, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    return str(review_path)
+
+
 class FL_AceStep_LabelSamples:
     """
     Auto-Label Samples
@@ -198,6 +254,39 @@ class FL_AceStep_LabelSamples:
                     "label": "Label guidance",
                     "placeholder": "Optional cultural or dataset-specific labelling instructions",
                 }),
+                "temperature": ("FLOAT", {
+                    "default": 0.2,
+                    "min": 0.0,
+                    "max": 1.5,
+                    "step": 0.05,
+                    "label": "LLM temperature",
+                }),
+                "top_p": ("FLOAT", {
+                    "default": 0.9,
+                    "min": 0.0,
+                    "max": 1.0,
+                    "step": 0.05,
+                    "label": "LLM top-p",
+                }),
+                "top_k": ("INT", {
+                    "default": 30,
+                    "min": 0,
+                    "max": 200,
+                    "step": 5,
+                    "label": "LLM top-k",
+                }),
+                "max_new_tokens": ("INT", {
+                    "default": 768,
+                    "min": 128,
+                    "max": 2048,
+                    "step": 64,
+                    "label": "LLM max output tokens",
+                }),
+                "review_path": ("STRING", {
+                    "default": "./output/acestep/label_review.json",
+                    "multiline": False,
+                    "label": "Label review file",
+                }),
             }
         }
 
@@ -219,9 +308,19 @@ class FL_AceStep_LabelSamples:
         llm_batch_size=2,
         language="Auto",
         label_guidance="",
+        temperature=0.2,
+        top_p=0.9,
+        top_k=30,
+        max_new_tokens=768,
+        review_path="./output/acestep/label_review.json",
     ):
         """Label all samples in the dataset."""
         logger.info("Starting auto-labeling...")
+        logger.info(
+            "Label constraints: language=%s, guidance=%s",
+            language,
+            "provided" if label_guidance.strip() else "none",
+        )
 
         # Verify this is an ACE-Step model
         if not is_acestep_model(model):
@@ -255,6 +354,9 @@ class FL_AceStep_LabelSamples:
         errors = []
         batch_size = max(1, int(llm_batch_size))
         understand_batch = getattr(llm, "understand_audio_from_codes_batch", None)
+        language_name = (
+            language.split(" — ", 1)[1] if language != "Auto" else None
+        )
         metadata_by_index = {}
         code_items = []
         format_items = []
@@ -293,6 +395,8 @@ class FL_AceStep_LabelSamples:
                     idx,
                     codes,
                     _build_lyrics_context(sample, language, label_guidance),
+                    language,
+                    label_guidance,
                 ))
             else:
                 logger.warning(f"No audio codes for sample {idx}, skipping LLM labeling")
@@ -306,14 +410,36 @@ class FL_AceStep_LabelSamples:
                 try:
                     codes = [item[1] for item in batch]
                     lyrics_contexts = [item[2] for item in batch]
+                    language_hints = [item[3] for item in batch]
+                    label_guidances = [item[4] for item in batch]
                     if understand_batch is not None:
-                        metadata = understand_batch(codes, lyrics_contexts)
+                        metadata = understand_batch(
+                            codes,
+                            lyrics_contexts,
+                            language_hints,
+                            label_guidances,
+                            temperature=float(temperature),
+                            top_k=int(top_k),
+                            top_p=float(top_p),
+                            max_new_tokens=int(max_new_tokens),
+                        )
                     else:
                         metadata = [
-                            llm.understand_audio_from_codes(code, lyrics_context=context)
-                            for code, context in zip(codes, lyrics_contexts)
+                            llm.understand_audio_from_codes(
+                                code,
+                                lyrics_context=context,
+                                language_hint=language_hint,
+                                label_guidance=guidance,
+                                temperature=float(temperature),
+                                top_k=int(top_k),
+                                top_p=float(top_p),
+                                max_new_tokens=int(max_new_tokens),
+                            )
+                            for code, context, language_hint, guidance in zip(
+                                codes, lyrics_contexts, language_hints, label_guidances
+                            )
                         ]
-                    for (idx, _, _), item_metadata in zip(batch, metadata):
+                    for (idx, _, _, _, _), item_metadata in zip(batch, metadata):
                         metadata_by_index[idx] = item_metadata
                     logger.info(
                         "LLM labelling batch %d/%d complete",
@@ -337,6 +463,12 @@ class FL_AceStep_LabelSamples:
                         instruction_context=_build_lyrics_context(
                             sample, language, label_guidance
                         ),
+                        language_hint=language,
+                        label_guidance=label_guidance,
+                        temperature=float(temperature),
+                        top_k=int(top_k),
+                        top_p=float(top_p),
+                        max_new_tokens=int(max_new_tokens),
                     )
                 except Exception as e:
                     logger.warning(f"Error formatting sample {idx}: {e}")
@@ -351,6 +483,7 @@ class FL_AceStep_LabelSamples:
                 continue
 
             try:
+                metadata = _enforce_language_metadata(metadata, language)
                 if metadata.get("caption"):
                     sample.caption = metadata["caption"]
                 if metadata.get("genre"):
@@ -365,8 +498,10 @@ class FL_AceStep_LabelSamples:
                         sample.timesignature = metadata["timesignature"]
 
                 if metadata.get("language"):
-                    sample.language = metadata["language"]
+                    sample.language = language_name or metadata["language"]
                     sample.is_instrumental = metadata["language"].lower() == "instrumental"
+                elif language_name:
+                    sample.language = language_name
 
                 if metadata.get("lyrics") and metadata["lyrics"] != "[Instrumental]":
                     if transcribe_lyrics or format_lyrics:
@@ -395,5 +530,12 @@ class FL_AceStep_LabelSamples:
             status += f" ({len(errors)} errors)"
 
         logger.info(status)
+
+        try:
+            review_file = _write_label_review(review_path, samples)
+            status += f"; review file: {review_file}"
+            logger.info("Label review exported to %s", review_file)
+        except Exception as e:
+            logger.warning("Could not export label review file: %s", e)
 
         return (dataset, labeled_count, status)

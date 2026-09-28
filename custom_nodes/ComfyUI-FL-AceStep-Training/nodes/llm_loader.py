@@ -76,6 +76,8 @@ class ACEStepLLMHandler:
         self,
         audio_codes: str,
         lyrics_context: str = "",
+        language_hint: str = "Auto",
+        label_guidance: str = "",
         temperature: float = 0.3,
         top_k: int = 50,
         top_p: float = 0.95,
@@ -94,7 +96,9 @@ class ACEStepLLMHandler:
         Returns:
             Dictionary with generated metadata (caption, bpm, keyscale, etc.)
         """
-        messages = self._build_understanding_messages(audio_codes, lyrics_context)
+        messages = self._build_understanding_messages(
+            audio_codes, lyrics_context, language_hint, label_guidance
+        )
         response = self._generate(
             messages,
             temperature=temperature,
@@ -109,6 +113,8 @@ class ACEStepLLMHandler:
         self,
         audio_codes: list[str],
         lyrics_contexts: list[str] = None,
+        language_hints: list[str] = None,
+        label_guidances: list[str] = None,
         temperature: float = 0.3,
         top_k: int = 50,
         top_p: float = 0.95,
@@ -117,9 +123,17 @@ class ACEStepLLMHandler:
         """Generate metadata for several audio-code prompts in one batch."""
         if lyrics_contexts is None:
             lyrics_contexts = [""] * len(audio_codes)
+        if language_hints is None:
+            language_hints = ["Auto"] * len(audio_codes)
+        if label_guidances is None:
+            label_guidances = [""] * len(audio_codes)
         messages = [
-            self._build_understanding_messages(codes, context)
-            for codes, context in zip(audio_codes, lyrics_contexts)
+            self._build_understanding_messages(
+                codes, context, language_hint, guidance
+            )
+            for codes, context, language_hint, guidance in zip(
+                audio_codes, lyrics_contexts, language_hints, label_guidances
+            )
         ]
         responses = self._generate_batch(
             messages,
@@ -136,7 +150,11 @@ class ACEStepLLMHandler:
         lyrics: str,
         user_metadata: dict = None,
         instruction_context: str = "",
+        language_hint: str = "Auto",
+        label_guidance: str = "",
         temperature: float = 0.85,
+        top_k: int = 50,
+        top_p: float = 0.95,
         max_new_tokens: int = 768,
     ):
         """
@@ -152,22 +170,48 @@ class ACEStepLLMHandler:
         Returns:
             Dictionary with formatted metadata
         """
-        messages = self._build_formatting_messages(caption, lyrics, instruction_context)
+        messages = self._build_formatting_messages(
+            caption, lyrics, instruction_context, language_hint, label_guidance
+        )
         response = self._generate(
             messages,
             temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
             max_new_tokens=max_new_tokens,
         )
         logger.info(f"LLM formatting response length: {len(response)}")
         return self._parse_response(response)
 
-    def _build_understanding_messages(self, audio_codes: str, lyrics_context: str = "") -> list:
+    def _build_understanding_messages(
+        self,
+        audio_codes: str,
+        lyrics_context: str = "",
+        language_hint: str = "Auto",
+        label_guidance: str = "",
+    ) -> list:
         """Build ChatML messages for audio understanding."""
+        system_content = UNDERSTAND_INSTRUCTION
+        if language_hint != "Auto":
+            language_code, language_name = language_hint.split(" — ", 1)
+            system_content += (
+                "# Dataset language constraint\n"
+                f"The dataset language is {language_name} (ISO 639-1: {language_code}). "
+                "Treat this as authoritative. Describe language and cultural context "
+                "as the selected language unless the supplied evidence "
+                "clearly proves otherwise. Do not substitute a different regional "
+                "category based only on instrumental associations.\n\n"
+            )
+        if label_guidance.strip():
+            system_content += (
+                "# Dataset labelling guidance\n"
+                f"{label_guidance.strip()}\n\n"
+            )
         user_content = audio_codes
         if lyrics_context:
             user_content = f"{audio_codes}\n\n{lyrics_context}"
         return [
-            {"role": "system", "content": UNDERSTAND_INSTRUCTION},
+            {"role": "system", "content": system_content},
             {"role": "user", "content": user_content},
         ]
 
@@ -176,15 +220,26 @@ class ACEStepLLMHandler:
         caption: str,
         lyrics: str,
         instruction_context: str = "",
+        language_hint: str = "Auto",
+        label_guidance: str = "",
     ) -> list:
         """Build ChatML messages for sample formatting."""
         caption = caption or "NO USER INPUT"
         lyrics = lyrics or "[Instrumental]"
+        system_content = FORMAT_INSTRUCTION
+        if language_hint != "Auto":
+            language_code, language_name = language_hint.split(" — ", 1)
+            system_content += (
+                f"The dataset language is {language_name} (ISO 639-1: {language_code}) "
+                "and must be retained in the formatted metadata.\n"
+            )
+        if label_guidance.strip():
+            system_content += f"Dataset labelling guidance: {label_guidance.strip()}\n"
         user_content = f"# Caption\n{caption}\n\n# Lyric\n{lyrics}"
         if instruction_context:
             user_content = f"{user_content}\n\n{instruction_context}"
         return [
-            {"role": "system", "content": FORMAT_INSTRUCTION},
+            {"role": "system", "content": system_content},
             {"role": "user", "content": user_content},
         ]
 
